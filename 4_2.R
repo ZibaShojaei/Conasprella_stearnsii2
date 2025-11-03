@@ -254,24 +254,28 @@ pred_mat_reg <- recipes::bake(prep_tmp_reg, new_data = NULL) %>% dplyr::select(-
 
 
 # --- R4) Define XGBoost regression model and tuning grid ---
-# Set up a regression XGBoost model (predicting abundance values),
-# fix the learning rate at 0.10, and tune the main parameters
-# using a Latin hypercube grid with 12 random combinations.
+# Regularized XGBoost: smaller tree depth, higher min_n, and fewer trees to reduce point-like predictions
+
 
 xgb_spec_reg <- parsnip::boost_tree(
-  trees = tune(), tree_depth = tune(), min_n = tune(),
-  loss_reduction = tune(), mtry = tune(),
-  sample_size = 0.8, learn_rate = 0.10
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  mtry = tune(),
+  sample_size = 0.8,
+  learn_rate = 0.05   # smoother learning to reduce overfitting
 ) %>%
-  parsnip::set_engine("xgboost", eval_metric = "rmse",
-                      nthread = max(1, parallel::detectCores()-1)) %>%
+  parsnip::set_engine("xgboost",
+                      eval_metric = "rmse",
+                      nthread = max(1, parallel::detectCores() - 1)) %>%
   parsnip::set_mode("regression")
 
 xgb_grid_reg <- dials::grid_latin_hypercube(
-  dials::trees(range = c(300, 2000)),
-  dials::tree_depth(range = c(2, 8)),
-  dials::min_n(),
-  dials::loss_reduction(),
+  dials::trees(range = c(200, 600)),        # fewer trees (prevent overfit)
+  dials::tree_depth(range = c(2, 4)),       # shallower trees
+  dials::min_n(range = c(5, 15)),           # larger node size
+  dials::loss_reduction(range = c(0, 5)),   # extra regularization
   dials::finalize(dials::mtry(), pred_mat_reg),
   size = 12
 )
@@ -363,13 +367,6 @@ plot(st_geometry(study_area), col = "lightblue", main = "Study Area")
 plot(pts_sf, add = TRUE, col = "red", pch = 20)
 
 
-######check
-
-nrow(DATA)                            # total rows
-nrow(DATA %>% filter(Depth.B > 0))    # kept
-nrow(DATA %>% filter(!(Depth.B > 0))) # removed
-
-
 #############base map
 library(sf)
 library(ggplot2)
@@ -415,21 +412,49 @@ pts_m <- st_as_sf(DATA, coords = c("Longitude","Latitude"), crs = 4326) |>
   st_transform(32617)
 
 # template raster (250 m resolution)
-tmpl <- rast(ext(vect(sa_m)), resolution = 250, crs = crs(vect(sa_m)))
+tmpl <- rast(ext(vect(sa_m)), resolution = 100, crs = crs(vect(sa_m)))
+# coarser 500 m grid to smooth predictions and reduce point-like patterns
 
-# helper function for IDW
-idw_raster <- function(var, pts, tmpl, sa_m, DATA){
+
+#IDW
+#helper function for IDW
+
+idw_raster <- function(var, pts, tmpl, sa_m, DATA) {
   ok <- is.finite(DATA[[var]])
   if (sum(ok) < 3) return(NULL)
-  sp_pts <- as(pts[ok,], "Spatial"); sp_pts$val <- DATA[[var]][ok]
-  gs <- gstat::gstat(formula = val ~ 1, data = sp_pts, nmax = 8, set = list(idp = 1.5))
+  
+  # Prepare spatial points
+  sp_pts <- as(pts[ok, ], "Spatial")
+  sp_pts$val <- DATA[[var]][ok]
+  
+  # IDW interpolation (smoother settings)
+  gs <- gstat::gstat(formula = val ~ 1, data = sp_pts, nmax = 40, set = list(idp = 0.5))
+  
+  # Create grid for interpolation
   grd_df <- as.data.frame(terra::xyFromCell(tmpl, 1:terra::ncell(tmpl)))
-  names(grd_df) <- c("x","y"); coordinates(grd_df) <- ~x+y; gridded(grd_df) <- TRUE
+  names(grd_df) <- c("x", "y")
+  coordinates(grd_df) <- ~x + y
+  gridded(grd_df) <- TRUE
   proj4string(grd_df) <- proj4string(sp_pts)
-  pred <- predict(gs, grd_df)
-  r_idw <- terra::rast(pred["var1.pred"]); names(r_idw) <- var
-  terra::mask(r_idw, vect(sa_m))
+  
+  # Predict and safely convert to raster
+  pred <- try(predict(gs, grd_df), silent = TRUE)
+  if (inherits(pred, "try-error")) return(NULL)
+  
+  r_idw <- try(terra::rast(as(pred["var1.pred"], "SpatialPixelsDataFrame")), silent = TRUE)
+  if (inherits(r_idw, "try-error") || is.null(r_idw) || nlyr(r_idw) == 0) return(NULL)
+  
+  # Mask and smooth
+  names(r_idw) <- var
+  r_idw <- terra::mask(r_idw, vect(sa_m))
+  r_idw <- terra::focal(r_idw, w = 3, fun = mean, na.policy = "omit", na.rm = TRUE, fillvalue = NA)
+  
+  return(r_idw)
 }
+
+
+#IDW end 
+
 
 # run IDW for all numeric predictors
 rast_list <- lapply(num_vars, idw_raster, pts = pts_m, tmpl = tmpl, sa_m = sa_m, DATA = DATA)
@@ -527,8 +552,33 @@ for (v in intersect(num_cols, names(X))) {
 # 3. Load your trained classification model
 fit_cls <- readRDS("xgb_cls_final.rds")
 
-# 4. Predict probabilities for each grid cell
+# 4️⃣ Predict probabilities for each grid cell safely
+# Make sure all required predictors exist
+required_vars <- c("Depth.B","Temp.B","Sal.B","DO.B","pH.B",
+                   "SiltClayPercent","TOC","SAV1.P.A","SAV2.P.A","dist_oyster_m","G1_SAV1")
+
+missing_vars <- setdiff(required_vars, names(X))
+for (v in missing_vars) X[[v]] <- 0  # add missing variables if needed
+
+
+# ... all your previous steps creating X ...
+
+# ✅ Insert the check + fix block HERE
+if (nrow(X) == 0) stop("X is empty — prediction grid not created. Check your IDW results before proceeding.")
+
+missing_vars <- setdiff(c("Depth.B","Temp.B","Sal.B","DO.B","pH.B",
+                          "SiltClayPercent","TOC","SAV1.P.A","SAV2.P.A",
+                          "dist_oyster_m","G1_SAV1"), names(X))
+if (length(missing_vars) > 0) {
+  for (v in missing_vars) {
+    X[[v]] <- rep(0, nrow(X))
+  }
+}
+
+# THEN run your prediction line
 pred_probs <- predict(fit_cls, new_data = X, type = "prob")
+
+
 
 # 5. Combine coordinates + predictions into final output
 pred_out <- cbind(coords, pred_probs)
@@ -539,10 +589,15 @@ saveRDS(pred_out, "xgb_prob_grid.rds")
 # 7. Quick check and save raster
 head(pred_out)
 
-# Save raster for later maps
-r_prob <- rast(pred_out[, c("x","y",".pred_1")], type = "xyz", crs = "EPSG:32617")
-writeRaster(r_prob, "xgb_prob_map.tif", overwrite = TRUE)
+# --- Save and smooth prediction raster for mapping ---
+# Create raster from predicted probabilities
+r_prob <- rast(pred_out[, c("x", "y", ".pred_1")], type = "xyz", crs = "EPSG:32617")
 
+# Aggregate to coarser grid (2x2 cells) to reduce point-like patterns
+r_prob <- terra::aggregate(r_prob, fact = 2, fun = mean, na.rm = TRUE)
+
+# Save final smoothed raster for later mapping
+writeRaster(r_prob, "xgb_prob_map.tif", overwrite = TRUE)
 
 
 ##########
@@ -566,25 +621,6 @@ names(r_prob_wgs) <- "prob_presence"
 r_df <- as.data.frame(r_prob_wgs, xy = TRUE, na.rm = TRUE)
 
 
-# 4) Study area in WGS84
-sa <- st_read("study_area_bay_water.shp", quiet = TRUE) |> st_make_valid() |> st_transform(4326)
-
-# 5) Plot (use raster extent)
-ggplot() +
-  annotation_map_tile(type = "cartolight", zoomin = -1) +
-  geom_raster(data = r_df, aes(x = x, y = y, fill = prob_presence),
-              alpha = 0.6, interpolate = TRUE) +
-  scale_fill_gradientn(
-    colours = c("#08306b","#2171b5","#6baed6","#fdae6b","#f16913","#a63603"),
-    limits = c(0,1)
-  ) +
-  geom_sf(data = sa, fill = NA, color = "red", linewidth = 0.6) +
-  coord_sf(xlim = range(r_df$x), ylim = range(r_df$y), expand = FALSE) +
-  theme_minimal()
-
-##########problem: it doesnt show basemap. it's small
-
-
 # --- Final map: predicted habitat raster with coastline and county outlines ---
 library(terra)
 library(sf)
@@ -604,9 +640,14 @@ fl_outline <- st_read("Detailed_Florida_State_Boundary.shp") |>
   st_transform(4326)
 
 
-# 4️⃣ Plot raster + coastline + counties
-plot(r_prob_wgs, main = "Predicted Habitat Suitability — XGBoost Model")
-plot(st_geometry(coastline), add = TRUE, col = "black", lwd = 0.8)
+
+# 4️⃣ Plot predicted raster + detailed Florida outline
+plot(r_prob_wgs,
+     main = "Predicted Habitat Suitability — XGBoost Model",
+     col = colorRampPalette(c("gray60","lightgreen","yellow","orange","red"))(100),
+     colNA = "gray90",
+     range = c(0,1))
+
 
 
 
@@ -653,17 +694,47 @@ r_bin_wgs <- project(r_bin, "EPSG:4326")
 r_df <- as.data.frame(r_bin_wgs, xy = TRUE, na.rm = TRUE)
 names(r_df)[3] <- "suitability"
 
-# 7️⃣ Load coastline
-coastline <- rnaturalearth::ne_coastline(scale = "medium", returnclass = "sf")
+
+# 7️⃣ Load detailed Florida coastline shapefile (better resolution)
+fl_outline <- st_read("Detailed_Florida_State_Boundary.shp") |>
+  st_make_valid() |> 
+  st_transform(4326)
+
 
 # 8️⃣ Plot final binary habitat map
-# --- Fixed final plotting section with visible legend ---
-# --- Final clean plot with simple legend only ---
-# --- Force legend to appear ---
-# --- Final clean version with legend below title ---
-# --- Final clean binary map ---
+
+# --- Final clean binary map with fixed legend size and style ---
+
+par(mar = c(4, 4, 4, 6))  # space for legend on the right
+
+# Plot binary raster
+plot(r_bin_wgs,
+     col = c("gray80", "purple"),
+     legend = FALSE,
+     main = "",
+     axes = TRUE,
+     box = TRUE)
+
+# Add outlines
+plot(st_geometry(fl_outline), add = TRUE, border = "gray40", lwd = 0.8)
+plot(st_geometry(sa), add = TRUE, border = "red", lwd = 0.8)
+
+# Add title
+mtext("Binary Habitat Map — XGBoost Model", side = 3, line = 1, adj = 0, font = 2, cex = 1.1)
+
+# Add properly sized legend
+par(xpd = TRUE)
+legend("topright",
+       inset = c(-0.05, 0),
+       legend = c("Unsuitable habitat", "Suitable habitat"),
+       fill = c("gray80", "purple"),
+       border = "black",
+       bg = "white",
+       box.lwd = 0.5,
+       cex = 0.8,     # balanced text size
+       pt.cex = 0.9)  # box size slightly smaller
+par(xpd = FALSE)
 
 
 
 
-# Projection: EPSG:4326 — all layers aligned
